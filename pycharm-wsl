@@ -1,0 +1,432 @@
+#!/usr/bin/env bash
+# Manage JetBrains PyCharm under WSL: list / install / uninstall / activate.
+# Encodes the manual WSL setup: tarball under ~/downloads, shell alias,
+# WSLg vmoptions fix, Windows shortcut via wslu.
+set -euo pipefail
+
+PRODUCT_CODE="${PYCHARM_PRODUCT_CODE:-PCP}" # PCP = Professional, PCC = Community
+INSTALL_ROOT="${PYCHARM_INSTALL_ROOT:-$HOME/downloads}"
+STABLE_LINK="${PYCHARM_STABLE_LINK:-$INSTALL_ROOT/pycharm}"
+ZSHRC="${PYCHARM_ZSHRC:-$HOME/.zshrc}"
+SHORTCUT_NAME="${PYCHARM_SHORTCUT_NAME:-PyCharm WSL}"
+VM_OPTION_SHADOW="-Dsun.awt.wl.Shadow=false"
+LIST_LIMIT="${PYCHARM_LIST_LIMIT:-30}"
+
+usage() {
+  cat <<'EOF'
+Usage: pycharm-wsl <command> [args]
+
+Commands:
+  list                         Available releases; mark (installed) / (active)
+  install VERSION [--no-activate]
+                               Download + extract VERSION (from list).
+                               Activates it by default (runtime hooks included).
+  uninstall VERSION [--keep-archive]
+                               Remove an installed extract (and its .tar.gz).
+  activate VERSION             Point symlink/alias/shortcut at VERSION and
+                               apply WSL runtime fixes (idempotent).
+
+Env:
+  PYCHARM_PRODUCT_CODE   PCP (default) or PCC
+  PYCHARM_INSTALL_ROOT   default: ~/downloads
+  PYCHARM_STABLE_LINK    default: $INSTALL_ROOT/pycharm
+  PYCHARM_LIST_LIMIT     max remote versions shown (default: 30)
+EOF
+}
+
+log() { printf '+ %s\n' "$*"; }
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+ensure_install_root() {
+  mkdir -p "$INSTALL_ROOT"
+}
+
+version_dir() {
+  printf '%s/pycharm-%s\n' "$INSTALL_ROOT" "$1"
+}
+
+version_archive() {
+  printf '%s/pycharm-%s.tar.gz\n' "$INSTALL_ROOT" "$1"
+}
+
+is_installed() {
+  local dir
+  dir="$(version_dir "$1")"
+  [[ -x "$dir/bin/pycharm.sh" ]]
+}
+
+version_from_dir() {
+  local dir="$1"
+  if [[ -f "$dir/product-info.json" ]]; then
+    jq -r '.version // empty' <"$dir/product-info.json"
+    return 0
+  fi
+  local base
+  base="$(basename "$dir")"
+  printf '%s\n' "${base#pycharm-}"
+}
+
+active_dir() {
+  if [[ -e "$STABLE_LINK/bin/pycharm.sh" ]]; then
+    readlink -f "$STABLE_LINK"
+  fi
+}
+
+active_version() {
+  local dir
+  dir="$(active_dir || true)"
+  [[ -n "${dir:-}" ]] || return 0
+  version_from_dir "$dir"
+}
+
+installed_versions() {
+  local dir
+  while IFS= read -r dir; do
+    [[ -x "$dir/bin/pycharm.sh" ]] || continue
+    version_from_dir "$dir"
+  done < <(find "$INSTALL_ROOT" -maxdepth 1 -type d -name 'pycharm-[0-9]*' 2>/dev/null | sort -V)
+}
+
+releases_all_json() {
+  require_cmd curl
+  require_cmd jq
+  curl -fsSL "https://data.services.jetbrains.com/products/releases?code=${PRODUCT_CODE}&type=release"
+}
+
+release_for_version() {
+  local version="$1"
+  releases_all_json | jq -c --arg code "$PRODUCT_CODE" --arg v "$version" '
+    .[$code][] | select(.version == $v)
+  ' | head -n1
+}
+
+# --- runtime hooks (used by activate; install calls activate by default) ---
+
+apply_vmoptions_fix() {
+  local version="${1:-}"
+  local config_dirs=() dir opts
+
+  if [[ -n "$version" ]]; then
+    mkdir -p "$HOME/.config/JetBrains/PyCharm${version}"
+    config_dirs=("$HOME/.config/JetBrains/PyCharm${version}")
+  fi
+  mapfile -t -O "${#config_dirs[@]}" config_dirs < <(
+    find "$HOME/.config/JetBrains" -maxdepth 1 -type d -name 'PyCharm*' 2>/dev/null || true
+  )
+
+  # Deduplicate
+  local -A seen=()
+  local unique=()
+  for dir in "${config_dirs[@]:-}"; do
+    [[ -n "$dir" ]] || continue
+    [[ -n "${seen[$dir]:-}" ]] && continue
+    seen[$dir]=1
+    unique+=("$dir")
+  done
+
+  for dir in "${unique[@]:-}"; do
+    opts="$dir/pycharm64.vmoptions"
+    # -- required: option string begins with -D
+    if [[ -f "$opts" ]] && grep -qxF -- "$VM_OPTION_SHADOW" "$opts"; then
+      log "vmoptions ok: $opts"
+      continue
+    fi
+    if [[ ! -f "$opts" ]]; then
+      cat >"$opts" <<EOF
+# custom PyCharm VM options (expand/override 'bin/pycharm64.vmoptions')
+
+$VM_OPTION_SHADOW
+EOF
+    else
+      printf '\n%s\n' "$VM_OPTION_SHADOW" >>"$opts"
+    fi
+    log "applied $VM_OPTION_SHADOW -> $opts"
+  done
+}
+
+ensure_wslu() {
+  if command -v wslusc >/dev/null 2>&1 && command -v wslview >/dev/null 2>&1; then
+    log "wslu present"
+    return 0
+  fi
+  log "installing wslu (needs sudo)"
+  require_cmd sudo
+  sudo apt-get update
+  if ! apt-cache show wslu >/dev/null 2>&1; then
+    sudo add-apt-repository -y ppa:wslutilities/wslu
+    sudo apt-get update
+  fi
+  sudo apt-get install -y wslu
+}
+
+update_shell_alias() {
+  local alias_target alias_line tmp
+  if [[ "$STABLE_LINK" == "$HOME/downloads/pycharm" ]]; then
+    alias_target='$HOME/downloads/pycharm/bin/pycharm.sh'
+  else
+    alias_target="$STABLE_LINK/bin/pycharm.sh"
+  fi
+  alias_line="alias pycharm='( \"$alias_target\" > /dev/null 2>&1 & )'"
+
+  touch "$ZSHRC"
+  if grep -qE '^alias pycharm=' "$ZSHRC"; then
+    tmp="$(mktemp)"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      if [[ "$line" == alias\ pycharm=* ]]; then
+        printf '%s\n' "$alias_line"
+      else
+        printf '%s\n' "$line"
+      fi
+    done <"$ZSHRC" >"$tmp"
+    mv "$tmp" "$ZSHRC"
+    log "updated pycharm alias in $ZSHRC"
+  else
+    {
+      printf '\n# PyCharm: launch via stable symlink managed by pycharm-wsl\n'
+      printf '%s\n' "$alias_line"
+    } >>"$ZSHRC"
+    log "added pycharm alias to $ZSHRC"
+  fi
+
+  if ! grep -q 'BROWSER=wslview' "$ZSHRC"; then
+    {
+      printf '\n# CLI tools that honor $BROWSER open links in Windows (wslu)\n'
+      printf 'command -v wslview >/dev/null && export BROWSER=wslview\n'
+    } >>"$ZSHRC"
+    log "added BROWSER=wslview to $ZSHRC"
+  fi
+}
+
+create_shortcut() {
+  local version="$1"
+  local dir icon launcher
+  dir="$(version_dir "$version")"
+  launcher="$dir/bin/pycharm.sh"
+  icon="$dir/bin/pycharm.png"
+  [[ -x "$launcher" ]] || die "missing launcher: $launcher"
+  ensure_wslu
+  if [[ -f "$icon" ]]; then
+    # wslusc historically needed ImageMagick for PNG → shortcut icon.
+    if ! command -v convert >/dev/null 2>&1; then
+      log "installing imagemagick for shortcut icon (needs sudo)"
+      sudo apt-get update
+      sudo apt-get install -y imagemagick
+    fi
+    wslusc -n "$SHORTCUT_NAME" -i "$icon" "$launcher"
+  else
+    wslusc -n "$SHORTCUT_NAME" "$launcher"
+  fi
+  log "shortcut: $SHORTCUT_NAME -> $launcher"
+}
+
+download_and_extract() {
+  local version="$1" link="$2" checksum_url="$3"
+  local archive dest tmp extract_root expected actual
+
+  archive="$(version_archive "$version")"
+  dest="$(version_dir "$version")"
+  ensure_install_root
+
+  if is_installed "$version"; then
+    log "already installed: $dest"
+    return 0
+  fi
+
+  if [[ ! -f "$archive" ]]; then
+    log "downloading $link"
+    curl -fL --progress-bar -o "$archive.partial" "$link"
+    mv "$archive.partial" "$archive"
+  else
+    log "reusing archive: $archive"
+  fi
+
+  if [[ -n "$checksum_url" ]]; then
+    log "verifying sha256"
+    expected="$(curl -fsSL "$checksum_url" | awk '{print $1}')"
+    actual="$(sha256sum "$archive" | awk '{print $1}')"
+    [[ "$expected" == "$actual" ]] || die "checksum mismatch for $archive"
+  fi
+
+  tmp="$(mktemp -d "$INSTALL_ROOT/.pycharm-extract.XXXXXX")"
+  log "extracting to $dest"
+  tar -xzf "$archive" -C "$tmp"
+  extract_root="$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -n1)"
+  [[ -n "$extract_root" ]] || {
+    rm -rf "$tmp"
+    die "archive contained no top-level directory"
+  }
+  rm -rf "$dest"
+  mv "$extract_root" "$dest"
+  rm -rf "$tmp"
+}
+
+# --- commands ---
+
+cmd_list() {
+  require_cmd jq
+  local active remote_json
+  local -A installed_set=()
+  local ver markers
+
+  active="$(active_version || true)"
+  while IFS= read -r ver; do
+    [[ -n "$ver" ]] || continue
+    installed_set["$ver"]=1
+  done < <(installed_versions)
+
+  remote_json="$(releases_all_json)"
+  printf 'product: %s\n' "$PRODUCT_CODE"
+  printf 'root:    %s\n' "$INSTALL_ROOT"
+  printf 'active:  %s\n' "${active:-'(none)'}"
+  printf '\n'
+
+  # Remote releases (newest first from API)
+  local count=0
+  while IFS= read -r ver; do
+    [[ -n "$ver" ]] || continue
+    markers=""
+    if [[ -n "${installed_set[$ver]:-}" ]]; then
+      markers=" (installed)"
+      unset "installed_set[$ver]"
+    fi
+    if [[ -n "$active" && "$ver" == "$active" ]]; then
+      markers="${markers} (active)"
+    fi
+    printf '%s%s\n' "$ver" "$markers"
+    count=$((count + 1))
+    [[ "$count" -ge "$LIST_LIMIT" ]] && break
+  done < <(jq -r --arg code "$PRODUCT_CODE" '.[$code][].version' <<<"$remote_json")
+
+  # Local-only installs not present in the remote window / catalog
+  local extras=()
+  for ver in "${!installed_set[@]}"; do
+    extras+=("$ver")
+  done
+  if [[ ${#extras[@]} -gt 0 ]]; then
+    printf '\n# local only\n'
+    local sorted
+    sorted="$(printf '%s\n' "${extras[@]}" | sort -V)"
+    while IFS= read -r ver; do
+      markers=" (installed)"
+      if [[ -n "$active" && "$ver" == "$active" ]]; then
+        markers="${markers} (active)"
+      fi
+      printf '%s%s\n' "$ver" "$markers"
+    done <<<"$sorted"
+  fi
+}
+
+cmd_install() {
+  local version="" no_activate=0
+  local arg json link checksum
+
+  for arg in "$@"; do
+    case "$arg" in
+      --no-activate) no_activate=1 ;;
+      -*) die "unknown option: $arg" ;;
+      *)
+        [[ -z "$version" ]] || die "unexpected argument: $arg"
+        version="$arg"
+        ;;
+    esac
+  done
+  [[ -n "$version" ]] || die "usage: install VERSION [--no-activate]"
+
+  json="$(release_for_version "$version")"
+  [[ -n "$json" ]] || die "version not in JetBrains catalog: $version (see list)"
+  link="$(jq -r '.downloads.linux.link // empty' <<<"$json")"
+  checksum="$(jq -r '.downloads.linux.checksumLink // empty' <<<"$json")"
+  [[ -n "$link" ]] || die "no linux download for $version"
+
+  log "installing PyCharm $version"
+  download_and_extract "$version" "$link" "$checksum"
+
+  if [[ "$no_activate" -eq 1 ]]; then
+    log "installed without activating (use: activate $version)"
+    return 0
+  fi
+  cmd_activate "$version"
+}
+
+cmd_uninstall() {
+  local version="" keep_archive=0
+  local arg dir archive active
+
+  for arg in "$@"; do
+    case "$arg" in
+      --keep-archive) keep_archive=1 ;;
+      -*) die "unknown option: $arg" ;;
+      *)
+        [[ -z "$version" ]] || die "unexpected argument: $arg"
+        version="$arg"
+        ;;
+    esac
+  done
+  [[ -n "$version" ]] || die "usage: uninstall VERSION [--keep-archive]"
+
+  dir="$(version_dir "$version")"
+  archive="$(version_archive "$version")"
+  is_installed "$version" || die "not installed: $version ($dir)"
+
+  active="$(active_version || true)"
+  if [[ -n "$active" && "$active" == "$version" ]]; then
+    rm -f "$STABLE_LINK"
+    log "cleared active symlink (was $version)"
+  fi
+
+  log "removing $dir"
+  rm -rf "$dir"
+
+  if [[ "$keep_archive" -eq 0 && -f "$archive" ]]; then
+    log "removing $archive"
+    rm -f "$archive"
+  elif [[ -f "$archive" ]]; then
+    log "keeping archive: $archive"
+  fi
+}
+
+cmd_activate() {
+  local version="${1:-}"
+  local dir
+  [[ -n "$version" ]] || die "usage: activate VERSION"
+  is_installed "$version" || die "not installed: $version (install it first)"
+  dir="$(version_dir "$version")"
+
+  ensure_install_root
+  ln -sfn "$dir" "$STABLE_LINK"
+  log "active: $STABLE_LINK -> $dir"
+
+  apply_vmoptions_fix "$version"
+  update_shell_alias
+
+  if grep -q 'microsoft\|WSL' /proc/version 2>/dev/null; then
+    if [[ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
+      log "warning: DISPLAY/WAYLAND_DISPLAY unset; WSLg may be unavailable"
+    else
+      log "display: DISPLAY=${DISPLAY:-} WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-}"
+    fi
+    create_shortcut "$version"
+  fi
+
+  log "activated $version — open a new shell or: source $ZSHRC"
+  log "launch: pycharm"
+}
+
+main() {
+  local cmd="${1:-}"
+  shift || true
+  case "$cmd" in
+    list) cmd_list "$@" ;;
+    install) cmd_install "$@" ;;
+    uninstall) cmd_uninstall "$@" ;;
+    activate) cmd_activate "$@" ;;
+    -h|--help|help|"") usage ;;
+    *) die "unknown command: $cmd (see --help)" ;;
+  esac
+}
+
+main "$@"
