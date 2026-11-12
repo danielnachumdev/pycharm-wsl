@@ -91,6 +91,278 @@ installed_versions() {
   done < <(find "$INSTALL_ROOT" -maxdepth 1 -type d -name 'pycharm-[0-9]*' 2>/dev/null | sort -V)
 }
 
+# JetBrains dataDirectoryName from product-info (e.g. PyCharm2026.3).
+data_dir_name() {
+  local info
+  info="$(version_dir "$1")/product-info.json"
+  [[ -f "$info" ]] || return 1
+  jq -r '.dataDirectoryName // empty' <"$info"
+}
+
+plugins_root() {
+  printf '%s/.local/share/JetBrains/%s\n' "$HOME" "$1"
+}
+
+plugin_entry_count() {
+  local d="$1"
+  [[ -d "$d" ]] || { printf '0\n'; return 0; }
+  find "$d" -mindepth 1 -maxdepth 1 ! -name '.*' 2>/dev/null | wc -l
+}
+
+# Best prior plugins dir: richest other installed version, else any leftover PyCharm* share dir.
+find_plugins_source() {
+  local target_name="$1"
+  local best="" best_count=0 dir name count ver
+
+  while IFS= read -r ver; do
+    [[ -n "$ver" ]] || continue
+    name="$(data_dir_name "$ver" 2>/dev/null || true)"
+    [[ -n "$name" && "$name" != "$target_name" ]] || continue
+    dir="$(plugins_root "$name")"
+    count="$(plugin_entry_count "$dir")"
+    if [[ "$count" -gt "$best_count" ]]; then
+      best="$dir"
+      best_count="$count"
+    fi
+  done < <(installed_versions | sort -Vr)
+
+  if [[ "$best_count" -eq 0 ]]; then
+    for dir in "$HOME"/.local/share/JetBrains/PyCharm*; do
+      [[ -d "$dir" ]] || continue
+      name="$(basename "$dir")"
+      [[ "$name" != "$target_name" ]] || continue
+      count="$(plugin_entry_count "$dir")"
+      if [[ "$count" -gt "$best_count" ]]; then
+        best="$dir"
+        best_count="$count"
+      fi
+    done
+  fi
+
+  [[ "$best_count" -gt 0 ]] && printf '%s\n' "$best"
+}
+
+# Copy user-installed plugins into the active version's share dir.
+# Uses rsync --ignore-existing so a partial/new dir fills in without clobbering.
+migrate_user_plugins() {
+  local version="$1"
+  local target_name target source before after
+  target_name="$(data_dir_name "$version" 2>/dev/null || true)"
+  [[ -n "$target_name" ]] || {
+    log "plugins: skip (no dataDirectoryName for $version)"
+    return 0
+  }
+  target="$(plugins_root "$target_name")"
+  source="$(find_plugins_source "$target_name" || true)"
+  if [[ -z "$source" ]]; then
+    log "plugins: nothing to migrate into $target_name"
+    return 0
+  fi
+
+  require_cmd rsync
+  before="$(plugin_entry_count "$target")"
+  mkdir -p "$target"
+  log "plugins: migrating $(basename "$source") -> $target_name"
+  rsync -a --ignore-existing "$source/" "$target/"
+  after="$(plugin_entry_count "$target")"
+  log "plugins: $before -> $after entries in $target"
+}
+
+config_root() {
+  printf '%s/.config/JetBrains/%s\n' "$HOME" "$1"
+}
+
+# Prior config dir that has the richest recentProjects.xml (bytes), else any other PyCharm* config.
+find_config_source() {
+  local target_name="$1"
+  local best="" best_size=0 dir name size ver recent
+
+  while IFS= read -r ver; do
+    [[ -n "$ver" ]] || continue
+    name="$(data_dir_name "$ver" 2>/dev/null || true)"
+    [[ -n "$name" && "$name" != "$target_name" ]] || continue
+    dir="$(config_root "$name")"
+    recent="$dir/options/recentProjects.xml"
+    [[ -f "$recent" ]] || continue
+    size="$(wc -c <"$recent" | tr -d ' ')"
+    if [[ "$size" -gt "$best_size" ]]; then
+      best="$dir"
+      best_size="$size"
+    fi
+  done < <(installed_versions | sort -Vr)
+
+  if [[ "$best_size" -eq 0 ]]; then
+    for dir in "$HOME"/.config/JetBrains/PyCharm*; do
+      [[ -d "$dir" ]] || continue
+      name="$(basename "$dir")"
+      [[ "$name" != "$target_name" ]] || continue
+      recent="$dir/options/recentProjects.xml"
+      [[ -f "$recent" ]] || continue
+      size="$(wc -c <"$recent" | tr -d ' ')"
+      if [[ "$size" -gt "$best_size" ]]; then
+        best="$dir"
+        best_size="$size"
+      fi
+    done
+  fi
+
+  [[ "$best_size" -gt 0 ]] && printf '%s\n' "$best"
+}
+
+# Copy config file if missing; for recentProjects-like maps, replace when source
+# has more <entry key=...> rows (a fresh IDE stub must not block a full history).
+copy_config_prefer_richer() {
+  local src="$1" dest="$2"
+  local src_n=0 dest_n=0
+  [[ -f "$src" ]] || return 0
+  mkdir -p "$(dirname "$dest")"
+  if [[ ! -f "$dest" ]]; then
+    cp -a "$src" "$dest"
+    log "config: copied $(basename "$dest")"
+    return 0
+  fi
+  src_n="$(grep -c 'entry key=' "$src" 2>/dev/null || true)"
+  dest_n="$(grep -c 'entry key=' "$dest" 2>/dev/null || true)"
+  # Non-map files (no entry keys): only fill if dest missing (handled above).
+  if [[ "$src_n" -eq 0 && "$dest_n" -eq 0 ]]; then
+    log "config: keep existing $(basename "$dest")"
+    return 0
+  fi
+  if [[ "$src_n" -gt "$dest_n" ]]; then
+    cp -a "$src" "$dest"
+    log "config: replaced $(basename "$dest") ($dest_n -> $src_n entries)"
+  else
+    log "config: keep existing $(basename "$dest") ($dest_n entries)"
+  fi
+}
+
+# Recent projects list + trust + matching workspace snapshots for the welcome screen.
+migrate_recent_projects() {
+  local version="$1"
+  local target_name target source
+  target_name="$(data_dir_name "$version" 2>/dev/null || true)"
+  [[ -n "$target_name" ]] || {
+    log "recent-projects: skip (no dataDirectoryName for $version)"
+    return 0
+  }
+  target="$(config_root "$target_name")"
+  source="$(find_config_source "$target_name" || true)"
+  if [[ -z "$source" ]]; then
+    log "recent-projects: nothing to migrate into $target_name"
+    return 0
+  fi
+
+  log "recent-projects: migrating $(basename "$source") -> $target_name"
+  mkdir -p "$target/options" "$target/workspace"
+  copy_config_prefer_richer "$source/options/recentProjects.xml" "$target/options/recentProjects.xml"
+  copy_config_prefer_richer "$source/options/trusted-paths.xml" "$target/options/trusted-paths.xml"
+  # Defaults: only seed if absent (no entry-key richness signal).
+  if [[ -f "$source/options/project.default.xml" && ! -f "$target/options/project.default.xml" ]]; then
+    cp -a "$source/options/project.default.xml" "$target/options/project.default.xml"
+    log "config: copied project.default.xml"
+  fi
+
+  if [[ -d "$source/workspace" ]]; then
+    require_cmd rsync
+    rsync -a --ignore-existing "$source/workspace/" "$target/workspace/"
+    log "recent-projects: workspace snapshots synced (ignore-existing)"
+  fi
+}
+
+# Prefer missing dest, else replace when source is strictly larger (fresh stubs are tiny).
+copy_file_prefer_larger() {
+  local src="$1" dest="$2"
+  local src_size=0 dest_size=0
+  [[ -f "$src" ]] || return 0
+  mkdir -p "$(dirname "$dest")"
+  src_size="$(wc -c <"$src" | tr -d ' ')"
+  if [[ ! -f "$dest" ]]; then
+    cp -a "$src" "$dest"
+    log "settings: copied $(basename "$(dirname "$dest")")/$(basename "$dest")"
+    return 0
+  fi
+  dest_size="$(wc -c <"$dest" | tr -d ' ')"
+  if [[ "$src_size" -gt "$dest_size" ]]; then
+    cp -a "$src" "$dest"
+    log "settings: replaced $(basename "$dest") (${dest_size} -> ${src_size} bytes)"
+  else
+    log "settings: keep existing $(basename "$dest")"
+  fi
+}
+
+sync_dir_ignore_existing() {
+  local src="$1" dest="$2" label="$3"
+  [[ -d "$src" ]] || return 0
+  require_cmd rsync
+  mkdir -p "$dest"
+  rsync -a --ignore-existing "$src/" "$dest/"
+  log "settings: synced $label (ignore-existing)"
+}
+
+# High-value IDE settings (not a full config clone — skips caches, tokens, promo noise).
+migrate_ide_settings() {
+  local version="$1"
+  local target_name target source f
+  target_name="$(data_dir_name "$version" 2>/dev/null || true)"
+  [[ -n "$target_name" ]] || {
+    log "settings: skip (no dataDirectoryName for $version)"
+    return 0
+  }
+  target="$(config_root "$target_name")"
+  source="$(find_config_source "$target_name" || true)"
+  if [[ -z "$source" ]]; then
+    log "settings: nothing to migrate into $target_name"
+    return 0
+  fi
+
+  log "settings: migrating $(basename "$source") -> $target_name"
+  mkdir -p "$target/options"
+
+  # SDKs / runtimes / VCS / DB / editor prefs
+  for f in \
+    jdk.table.xml \
+    pySdk.xml \
+    nodejs.xml \
+    editor.xml \
+    ide.general.xml \
+    ide.general.local.xml \
+    colors.scheme.xml \
+    editor-font.xml \
+    console-font.xml \
+    terminal-font.xml \
+    keymapFlags.xml \
+    github.xml \
+    gitlab.xml \
+    databaseSettings.xml \
+    databaseDrivers.xml \
+    diff.xml \
+    web-browsers.xml \
+    proxy.settings.xml \
+    remote-servers.xml \
+    llm.for.code.xml \
+    llm.mcpServers.xml \
+    llm.nextEdits.xml
+  do
+    copy_file_prefer_larger "$source/options/$f" "$target/options/$f"
+  done
+
+  # Top-level text/props (not under options/)
+  copy_file_prefer_larger "$source/disabled_plugins.txt" "$target/disabled_plugins.txt"
+  # idea.properties: only seed if absent so we don't clobber version-specific tweaks.
+  if [[ -f "$source/idea.properties" && ! -f "$target/idea.properties" ]]; then
+    cp -a "$source/idea.properties" "$target/idea.properties"
+    log "settings: copied idea.properties"
+  fi
+
+  sync_dir_ignore_existing "$source/keymaps" "$target/keymaps" "keymaps/"
+  sync_dir_ignore_existing "$source/codestyles" "$target/codestyles" "codestyles/"
+  sync_dir_ignore_existing "$source/inspection" "$target/inspection" "inspection/"
+  sync_dir_ignore_existing "$source/extensions" "$target/extensions" "extensions/"
+  sync_dir_ignore_existing "$source/grazie" "$target/grazie" "grazie/"
+  sync_dir_ignore_existing "$source/tasks" "$target/tasks" "tasks/"
+  sync_dir_ignore_existing "$source/ssl" "$target/ssl" "ssl/"
+}
+
 releases_all_json() {
   require_cmd curl
   require_cmd jq
@@ -461,6 +733,9 @@ cmd_activate() {
   ln -sfn "$dir" "$STABLE_LINK"
   log "active: $STABLE_LINK -> $dir"
 
+  migrate_user_plugins "$version"
+  migrate_recent_projects "$version"
+  migrate_ide_settings "$version"
   apply_vmoptions_fix "$version"
   update_shell_alias
 

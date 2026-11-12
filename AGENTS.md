@@ -31,7 +31,7 @@ How this repo works. Product pitch: [`README.md`](README.md).
 | `list` | Remote releases + local extracts; marks `(installed)` / `(active)` |
 | `install VERSION [--no-activate]` | Download, sha256-check, extract. Runs `activate` unless `--no-activate` |
 | `uninstall VERSION [--keep-archive]` | Remove extract (and archive unless `--keep-archive`). Clears symlink if that version was active |
-| `activate VERSION` | Point stable symlink + zsh alias + Windows shortcut at VERSION; apply WSLg vmoptions; ensure `wslu` |
+| `activate VERSION` | Point stable symlink + zsh alias + Windows shortcut at VERSION; migrate plugins + recent projects + IDE settings; apply WSLg vmoptions; ensure `wslu` |
 
 `list` is the detection check: if a local install is healthy it must show `(installed)`.
 
@@ -40,7 +40,19 @@ How this repo works. Product pitch: [`README.md`](README.md).
 | Concern | Command |
 | ------- | ------- |
 | Download / extract / checksum | `install` |
-| Symlink `~/downloads/pycharm`, zsh `pycharm` alias, `-Dsun.awt.wl.Shadow=false`, `BROWSER=wslview`, `wslusc -g` desktop shortcut | `activate` |
+| Symlink `~/downloads/pycharm`, zsh `pycharm` alias, plugins / recent projects / IDE settings, `-Dsun.awt.wl.Shadow=false`, `BROWSER=wslview`, `wslusc -g` desktop shortcut | `activate` |
+
+### State migration (on `activate`)
+
+| What | From → to | Policy |
+| ---- | --------- | ------ |
+| User plugins | `~/.local/share/JetBrains/<dataDirectoryName>/` | `rsync -a --ignore-existing` from richest prior dir |
+| Recent projects | `…/options/recentProjects.xml` (+ `trusted-paths.xml`, `project.default.xml`) | copy if missing; replace if source has more `entry key=` rows |
+| Workspace snapshots | `…/workspace/` | `rsync -a --ignore-existing` |
+| IDE settings | SDKs (`jdk.table.xml`, `pySdk.xml`, `nodejs.xml`), editor/UI XML, GitHub/GitLab/DB, `disabled_plugins.txt`; dirs `keymaps/`, `codestyles/`, `inspection/`, `extensions/`, `grazie/`, `tasks/`, `ssl/` | files: copy if missing or source larger; dirs: `--ignore-existing` |
+| Not migrated | caches/DBs, `user.web.token`, promo/survey XML, `bundled_plugins.txt`, `disabled_update.txt` | — |
+
+`dataDirectoryName` comes from that version’s `product-info.json` (e.g. `PyCharm2026.3`). `install` runs `activate` by default, so a normal upgrade migrates this automatically.
 
 Runtime hooks are idempotent and live in `activate` so version switches re-apply them.
 
@@ -83,7 +95,7 @@ Encoded operational knowledge (do not regress casually):
 | `PYCHARM_SHORTCUT_NAME` | `PyCharm WSL` |
 | `PYCHARM_LIST_LIMIT` | `30` |
 
-Dependencies: `bash`, `curl`, `jq`, `tar`; on WSL activate may install `wslu` / `imagemagick` via `apt` (sudo).
+Dependencies: `bash`, `curl`, `jq`, `tar`, `rsync`; on WSL activate may install `wslu` / `imagemagick` via `apt` (sudo).
 
 Optional: `pv` — if present, downloads use `pv -p -t -e -r -b` (bytes + rate + ETA). Otherwise curl’s classic progress meter (%, size, time left, speed) on a TTY.
 
