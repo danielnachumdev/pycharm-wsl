@@ -85,6 +85,8 @@ Encoded operational knowledge (do not regress casually):
 
 Dependencies: `bash`, `curl`, `jq`, `tar`; on WSL activate may install `wslu` / `imagemagick` via `apt` (sudo).
 
+Optional: `pv` — if present, downloads use `pv -p -t -e -r -b` (bytes + rate + ETA). Otherwise curl’s classic progress meter (%, size, time left, speed) on a TTY.
+
 ---
 
 ## Agent rules

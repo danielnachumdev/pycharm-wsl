@@ -238,6 +238,53 @@ create_shortcut() {
   log "shortcut: $SHORTCUT_NAME -> $wrapper -> $STABLE_LINK"
 }
 
+# Human size for logs (e.g. 1.3G). Falls back to raw bytes.
+fmt_bytes() {
+  local n="$1"
+  if command -v numfmt >/dev/null 2>&1; then
+    numfmt --to=iec-i --suffix=B --format='%.1f' "$n" 2>/dev/null && return 0
+  fi
+  printf '%s bytes\n' "$n"
+}
+
+# Download with size / speed / ETA when possible.
+# Prefer pv (bytes + ETA) if installed; else curl's classic progress meter
+# (% / transferred / time left / speed) — not the minimal --progress-bar.
+download_file() {
+  local url="$1" dest="$2" label="${3:-download}"
+  local size="" curl_stat pv_stat
+
+  size="$(
+    curl -fsSI "$url" 2>/dev/null \
+      | awk 'tolower($1) == "content-length:" { print $2 }' \
+      | tr -d '\r' \
+      | tail -n1 || true
+  )"
+
+  if [[ -t 2 ]] && command -v pv >/dev/null 2>&1 && [[ "$size" =~ ^[0-9]+$ ]]; then
+    log "downloading $label ($(fmt_bytes "$size")) via pv"
+    # shellcheck disable=SC2094
+    curl -fL "$url" | pv -s "$size" -p -t -e -r -b -N "$label" >"$dest"
+    curl_stat=${PIPESTATUS[0]}
+    pv_stat=${PIPESTATUS[1]}
+    [[ "$curl_stat" -eq 0 && "$pv_stat" -eq 0 ]] || die "download failed ($label): curl=$curl_stat pv=$pv_stat"
+    return 0
+  fi
+
+  if [[ -t 2 ]]; then
+    if [[ "$size" =~ ^[0-9]+$ ]]; then
+      log "downloading $label ($(fmt_bytes "$size")) — % / size / ETA / speed"
+    else
+      log "downloading $label"
+    fi
+    curl -fL -o "$dest" "$url" || die "download failed: $url"
+    return 0
+  fi
+
+  log "downloading $label (non-TTY)"
+  curl -fsL -o "$dest" "$url" || die "download failed: $url"
+}
+
 download_and_extract() {
   local version="$1" link="$2" checksum_url="$3"
   local archive dest tmp extract_root expected actual
@@ -252,8 +299,7 @@ download_and_extract() {
   fi
 
   if [[ ! -f "$archive" ]]; then
-    log "downloading $link"
-    curl -fL --progress-bar -o "$archive.partial" "$link"
+    download_file "$link" "$archive.partial" "pycharm-${version}"
     mv "$archive.partial" "$archive"
   else
     log "reusing archive: $archive"
